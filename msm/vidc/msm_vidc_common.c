@@ -11,13 +11,6 @@
 #include "msm_vidc_clocks.h"
 #include "msm_vidc_buffer_calculations.h"
 
-static struct kmem_cache *kmem_buf_pool;
-
-void __init init_vidc_kmem_buf_pool(void)
-{
-	kmem_buf_pool = KMEM_CACHE(msm_vidc_buffer, SLAB_HWCACHE_ALIGN | SLAB_PANIC);
-}
-
 #define IS_ALREADY_IN_STATE(__p, __d) (\
 	(__p >= __d)\
 )
@@ -1276,8 +1269,20 @@ static int wait_for_sess_signal_receipt(struct msm_vidc_inst *inst,
 		msecs_to_jiffies(
 			inst->core->resources.msm_vidc_hw_rsp_timeout));
 	if (!rc) {
-		s_vpr_e(inst->sid, "Wait interrupted or timed out: %d\n",
+		s_vpr_e(inst->sid, "Wait interrupted or timed out(sending ping cmd): %d\n",
 				SESSION_MSG_INDEX(cmd));
+		rc = call_hfi_op(hdev, core_ping, hdev->hfi_device_data, inst->sid);
+		rc = wait_for_completion_timeout(
+				&inst->core->completions[SYS_MSG_INDEX(HAL_SYS_PING_ACK)],
+				msecs_to_jiffies(
+				inst->core->resources.msm_vidc_hw_rsp_timeout));
+		if (rc) {
+			if (try_wait_for_completion(&inst->completions[SESSION_MSG_INDEX(cmd)])) {
+				s_vpr_e(inst->sid, "Received %d response. Continue session\n",
+								SESSION_MSG_INDEX(cmd));
+				return 0;
+			}
+		}
 		msm_comm_kill_session(inst);
 		rc = -EIO;
 	} else {
@@ -1904,6 +1909,28 @@ static void handle_stop_done(enum hal_command_response cmd, void *data)
 
 	s_vpr_l(inst->sid, "handled: SESSION_STOP_DONE\n");
 	signal_session_msg_receipt(cmd, inst);
+	put_inst(inst);
+}
+
+static void handle_ping_done(enum hal_command_response cmd, void *data)
+{
+	struct msm_vidc_cb_cmd_done *response = data;
+	struct msm_vidc_inst *inst;
+
+	if (!response) {
+		d_vpr_e("Failed to get valid response for stop\n");
+		return;
+	}
+
+	inst = get_inst(get_vidc_core(response->device_id),
+			response->inst_id);
+	if (!inst) {
+		d_vpr_e("Got a response for an inactive session\n");
+		return;
+	}
+
+	s_vpr_l(inst->sid, "handled: SYS_PING_DONE\n");
+	complete(&inst->core->completions[SYS_MSG_INDEX(HAL_SYS_PING_ACK)]);
 	put_inst(inst);
 }
 
@@ -2663,6 +2690,9 @@ static void handle_fbd(enum hal_command_response cmd, void *data)
 	}
 
 	if (inst->core->resources.ubwc_stats_in_fbd == 1) {
+		u32 frame_size =
+			(msm_vidc_get_mbs_per_frame(inst) / (32 * 8) * 3) / 2;
+
 		mutex_lock(&inst->ubwc_stats_lock);
 		inst->ubwc_stats.is_valid =
 			fill_buf_done->ubwc_cr_stat.is_valid;
@@ -2670,6 +2700,8 @@ static void handle_fbd(enum hal_command_response cmd, void *data)
 			fill_buf_done->ubwc_cr_stat.worst_cr;
 		inst->ubwc_stats.worst_cf =
 			fill_buf_done->ubwc_cr_stat.worst_cf;
+		if (frame_size)
+			inst->ubwc_stats.worst_cf /= frame_size;
 		mutex_unlock(&inst->ubwc_stats_lock);
 	}
 
@@ -2729,6 +2761,9 @@ void handle_cmd_response(enum hal_command_response cmd, void *data)
 	case HAL_SESSION_END_DONE:
 	case HAL_SESSION_ABORT_DONE:
 		handle_session_close(cmd, data);
+		break;
+	case HAL_SYS_PING_ACK:
+		handle_ping_done(cmd, data);
 		break;
 	case HAL_SESSION_EVENT_CHANGE:
 		handle_event_change(cmd, data);
@@ -6937,7 +6972,7 @@ struct msm_vidc_buffer *msm_comm_get_vidc_buffer(struct msm_vidc_inst *inst,
 
 	if (!found) {
 		/* this is new vb2_buffer */
-		mbuf = kmem_cache_zalloc(kmem_buf_pool, GFP_KERNEL);
+		mbuf = kzalloc(sizeof(struct msm_vidc_buffer), GFP_KERNEL);
 		if (!mbuf) {
 			s_vpr_e(inst->sid, "%s: alloc msm_vidc_buffer failed\n",
 				__func__);
@@ -7228,7 +7263,7 @@ static void kref_free_mbuf(struct kref *kref)
 	struct msm_vidc_buffer *mbuf = container_of(kref,
 			struct msm_vidc_buffer, kref);
 
-	kmem_cache_free(kmem_buf_pool, mbuf);
+	kfree(mbuf);
 }
 
 void kref_put_mbuf(struct msm_vidc_buffer *mbuf)
