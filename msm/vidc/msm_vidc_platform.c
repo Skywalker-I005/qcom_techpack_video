@@ -2388,6 +2388,14 @@ static const struct of_device_id msm_vidc_dt_device[] = {
 		.compatible = "qcom,qcm6490-vidc",
 		.data = &yupik_data,
 	},
+	{
+		.compatible = "qcom,yupik-vidc",
+		.data = &yupik_data,
+	},
+	{
+		.compatible = "qcom,qcm6490-vidc",
+		.data = &yupik_data,
+	},
 	{},
 };
 
